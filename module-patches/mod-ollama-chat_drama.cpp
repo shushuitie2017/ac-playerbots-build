@@ -95,7 +95,7 @@ namespace
             bool hasAudience = false;
             for (auto const& g : realGuids)
             {
-                if (ch->IsOn(g))
+                if (ch->DramaIsOn(g))
                 {
                     hasAudience = true;
                     break;
@@ -105,7 +105,7 @@ namespace
                 continue;
 
             // 机器人必须先加入该频道才能发言（Channel::Say 要求 IsOn）
-            if (!ch->IsOn(bot->GetGUID()))
+            if (!ch->DramaIsOn(bot->GetGUID()))
                 ch->JoinChannel(bot, "");
 
             ch->Say(bot->GetGUID(), pl.text, LANG_UNIVERSAL);
