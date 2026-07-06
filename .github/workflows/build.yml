@@ -1,0 +1,42 @@
+name: build-playerbots-images
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet /opt/ghc
+          df -h /
+
+      - name: Clone Playerbot core fork
+        run: |
+          git clone --depth 1 --branch Playerbot https://github.com/liyunfan1223/azerothcore-wotlk.git ac
+          cd ac/modules
+          git clone --depth 1 https://github.com/liyunfan1223/mod-playerbots.git
+
+      - name: Login GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build images
+        working-directory: ac
+        run: |
+          docker compose build ac-worldserver ac-authserver ac-db-import
+          docker image ls | head -10
+
+      - name: Tag and push
+        run: |
+          for svc in worldserver authserver db-import; do
+            SRC=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep "ac-wotlk-$svc" | head -1)
+            docker tag "$SRC" ghcr.io/shushuitie2017/ac-wotlk-$svc:playerbots
+            docker push ghcr.io/shushuitie2017/ac-wotlk-$svc:playerbots
+          done
