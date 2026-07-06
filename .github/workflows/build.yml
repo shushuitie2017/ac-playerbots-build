@@ -26,7 +26,9 @@ jobs:
           git clone --depth 1 --branch Playerbot https://github.com/liyunfan1223/azerothcore-wotlk.git ac
           cd ac/modules
           git clone --depth 1 https://github.com/liyunfan1223/mod-playerbots.git
-          git clone --depth 1 https://github.com/DustinHendrickson/mod-ollama-chat.git
+          # pin mod-ollama-chat：注入补丁按锚点匹配，上游漂移会导致锚点失效，锁死已验证 commit
+          git clone https://github.com/DustinHendrickson/mod-ollama-chat.git
+          git -C mod-ollama-chat checkout 8ba5e791f0a84ee04636f0b19b62d3c4aff3dce1
 
       - name: Patch login banner (remove attribution spam)
         run: python3 scripts/patch_login_banner.py ac
@@ -36,6 +38,9 @@ jobs:
 
       - name: Inject drama director module
         run: python3 scripts/inject_drama_module.py ac
+
+      - name: Inject long-term memory module
+        run: python3 scripts/inject_memory_module.py ac
 
       - name: Login GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
