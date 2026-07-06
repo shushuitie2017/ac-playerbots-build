@@ -31,6 +31,9 @@ jobs:
       - name: Patch login banner (remove attribution spam)
         run: python3 scripts/patch_login_banner.py ac
 
+      - name: Patch ChannelMgr (expose GetChannels)
+        run: python3 scripts/patch_channelmgr.py ac
+
       - name: Inject drama director module
         run: python3 scripts/inject_drama_module.py ac
 

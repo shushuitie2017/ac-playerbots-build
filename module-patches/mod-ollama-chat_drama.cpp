@@ -8,6 +8,9 @@
 #include "PlayerbotMgr.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
+#include "ChannelMgr.h"
+#include "Channel.h"
+#include "SharedDefines.h"
 #include <vector>
 #include <string>
 #include <mutex>
@@ -19,13 +22,20 @@ OllamaDramaDirector::OllamaDramaDirector() : WorldScript("OllamaDramaDirector") 
 
 namespace
 {
+    // 剧情状态（主线程访问，g_dramaMutex 保护）
     std::mutex g_dramaMutex;
     std::string g_topic;
     std::vector<std::string> g_transcript;
-    std::vector<uint64_t> g_participants;      // 参与吵架的机器人 GUID
+    std::vector<uint64_t> g_participants;       // 参与吵架的机器人 GUID
     std::vector<std::string> g_participantNames;
     int g_turn = 0;
     bool g_sceneActive = false;
+
+    // 异步 LLM 产出的待发行（在主线程发送，避免在工作线程碰频道/玩家对象）
+    struct PendingLine { uint64_t botGuid; std::string name; std::string text; };
+    std::mutex g_pendingMutex;
+    std::vector<PendingLine> g_pending;
+    bool g_queryInFlight = false;
 
     const std::vector<std::string> DRAMA_TOPICS = {
         "一个猎人在副本里抢了盗贼的敏捷皮甲装备，盗贼在综合频道开骂，两人对线。",
@@ -45,6 +55,65 @@ namespace
         std::uniform_int_distribution<size_t> d(0, DRAMA_TOPICS.size() - 1);
         return DRAMA_TOPICS[d(gen)];
     }
+
+    // 主线程：把一句台词发到「有真人玩家在场」的综合频道（General，channelId==1）
+    void PostLineToGeneral(PendingLine const& pl, uint32 dramaZone)
+    {
+        Player* bot = ObjectAccessor::FindPlayer(ObjectGuid(pl.botGuid));
+        if (!bot || !bot->IsInWorld())
+            return;
+
+        // 收集该区域内的真人玩家 GUID（吵架的观众）
+        std::vector<ObjectGuid> realGuids;
+        for (auto const& itr : ObjectAccessor::GetPlayers())
+        {
+            Player* p = itr.second;
+            if (!p || !p->IsInWorld())
+                continue;
+            if (PlayerbotsMgr::instance().GetPlayerbotAI(p))
+                continue;  // 跳过机器人
+            if (p->GetZoneId() != dramaZone)
+                continue;
+            realGuids.push_back(p->GetGUID());
+        }
+        if (realGuids.empty())
+            return;  // 没真人观众就不发，省算力
+
+        ChannelMgr* cMgr = ChannelMgr::forTeam(bot->GetTeamId());
+        if (!cMgr)
+            return;
+
+        for (auto const& kv : cMgr->GetChannels())
+        {
+            Channel* ch = kv.second;
+            if (!ch)
+                continue;
+            if (ch->GetChannelId() != 1)   // 1 = General(综合)
+                continue;
+
+            // 该综合频道里有没有我们的真人观众？
+            bool hasAudience = false;
+            for (auto const& g : realGuids)
+            {
+                if (ch->IsOn(g))
+                {
+                    hasAudience = true;
+                    break;
+                }
+            }
+            if (!hasAudience)
+                continue;
+
+            // 机器人必须先加入该频道才能发言（Channel::Say 要求 IsOn）
+            if (!ch->IsOn(bot->GetGUID()))
+                ch->JoinChannel(bot, "");
+
+            ch->Say(bot->GetGUID(), pl.text, LANG_UNIVERSAL);
+
+            if (g_DebugEnabled)
+                LOG_INFO("server.loading", "[Ollama Drama] {} -> 综合({}): {}", pl.name, ch->GetNumPlayers(), pl.text);
+        }
+    }
 }
 
 void OllamaDramaDirector::OnUpdate(uint32 diff)
@@ -54,6 +123,20 @@ void OllamaDramaDirector::OnUpdate(uint32 diff)
     if (!sConfigMgr->GetOption<bool>("OllamaChat.DramaEnable", true))
         return;
 
+    uint32 dramaZone = sConfigMgr->GetOption<uint32>("OllamaChat.DramaZone", 1637);  // 奥格瑞玛
+
+    // 1) 先在主线程把上一轮 LLM 产出的台词发出去
+    {
+        std::vector<PendingLine> toPost;
+        {
+            std::lock_guard<std::mutex> lk(g_pendingMutex);
+            toPost.swap(g_pending);
+        }
+        for (auto const& pl : toPost)
+            PostLineToGeneral(pl, dramaZone);
+    }
+
+    // 2) 计时器
     static uint32_t timer = 0;
     if (timer > diff)
     {
@@ -62,11 +145,17 @@ void OllamaDramaDirector::OnUpdate(uint32 diff)
     }
 
     uint32 intervalSec    = sConfigMgr->GetOption<uint32>("OllamaChat.DramaIntervalSeconds", 25);
-    uint32 dramaZone      = sConfigMgr->GetOption<uint32>("OllamaChat.DramaZone", 1637);      // 奥格瑞玛
     uint32 participantMax = sConfigMgr->GetOption<uint32>("OllamaChat.DramaParticipants", 3);
     uint32 turnsPerScene  = sConfigMgr->GetOption<uint32>("OllamaChat.DramaTurnsPerScene", 8);
     if (intervalSec < 5) intervalSec = 5;
     timer = intervalSec * 1000;
+
+    // 上一句还在生成就不叠加新请求
+    {
+        std::lock_guard<std::mutex> lk(g_pendingMutex);
+        if (g_queryInFlight)
+            return;
+    }
 
     std::lock_guard<std::mutex> lock(g_dramaMutex);
 
@@ -89,7 +178,7 @@ void OllamaDramaDirector::OnUpdate(uint32 diff)
         if (zoneBots.size() < 2)
         {
             g_sceneActive = false;
-            return;  // 奥格此刻机器人不足 2 个，等下次
+            return;
         }
 
         std::shuffle(zoneBots.begin(), zoneBots.end(), std::mt19937(std::random_device{}()));
@@ -139,48 +228,41 @@ void OllamaDramaDirector::OnUpdate(uint32 diff)
 
     g_turn++;
 
-    // 异步查询 LLM 后在频道发言（照搬随机闲聊的线程安全模式）
-    std::thread([speakerGuid, prompt, speakerName]()
     {
+        std::lock_guard<std::mutex> lk(g_pendingMutex);
+        g_queryInFlight = true;
+    }
+
+    // 异步查询 LLM（只做网络请求，不碰任何游戏对象）
+    std::thread([speakerGuid, speakerName, prompt]()
+    {
+        std::string response;
         try
         {
-            Player* botPtr = ObjectAccessor::FindPlayer(ObjectGuid(speakerGuid));
-            if (!botPtr)
-                return;
-
-            std::string response = QueryOllamaAPI(prompt);
-            if (response.empty())
-                return;
-
-            // 去掉可能的首尾引号/换行
-            while (!response.empty() && (response.front() == '"' || response.front() == '\n' || response.front() == ' '))
-                response.erase(response.begin());
-            while (!response.empty() && (response.back() == '"' || response.back() == '\n' || response.back() == ' '))
-                response.pop_back();
-            if (response.empty())
-                return;
-
-            botPtr = ObjectAccessor::FindPlayer(ObjectGuid(speakerGuid));
-            if (!botPtr)
-                return;
-            PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(botPtr);
-            if (!botAI)
-                return;
-
-            bool sent = botAI->SayToChannel(response, ChatChannelId::GENERAL);
-
-            {
-                std::lock_guard<std::mutex> lock(g_dramaMutex);
-                g_transcript.push_back(speakerName + "：" + response);
-            }
-
-            if (g_DebugEnabled)
-                LOG_INFO("server.loading", "[Ollama Drama] {} -> General ({}): {}",
-                         speakerName, sent ? "ok" : "fail", response);
+            response = QueryOllamaAPI(prompt);
         }
         catch (...)
         {
-            LOG_ERROR("server.loading", "[Ollama Drama] exception in drama thread");
+            response.clear();
         }
+
+        // 去掉首尾引号/换行/空格
+        while (!response.empty() && (response.front() == '"' || response.front() == '\n' || response.front() == ' '))
+            response.erase(response.begin());
+        while (!response.empty() && (response.back() == '"' || response.back() == '\n' || response.back() == ' '))
+            response.pop_back();
+
+        if (!response.empty())
+        {
+            {
+                std::lock_guard<std::mutex> lk(g_dramaMutex);
+                g_transcript.push_back(speakerName + "：" + response);
+            }
+            std::lock_guard<std::mutex> lk(g_pendingMutex);
+            g_pending.push_back({ speakerGuid, speakerName, response });
+        }
+
+        std::lock_guard<std::mutex> lk(g_pendingMutex);
+        g_queryInFlight = false;
     }).detach();
 }
