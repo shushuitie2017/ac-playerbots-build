@@ -44,6 +44,9 @@ jobs:
       - name: Inject long-term memory module
         run: python3 scripts/inject_memory_module.py ac
 
+      - name: Patch mod-ah-bot (include all mounts in sell pool)
+        run: python3 scripts/patch_ahbot_mounts.py ac
+
       - name: Login GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
