@@ -47,6 +47,9 @@ jobs:
       - name: Patch mod-ah-bot (include all mounts in sell pool)
         run: python3 scripts/patch_ahbot_mounts.py ac
 
+      - name: Patch allow duels in Orgrimmar (bots auto-duel in capital)
+        run: python3 scripts/patch_orgrimmar_duels.py ac
+
       - name: Login GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
